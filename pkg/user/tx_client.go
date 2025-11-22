@@ -407,6 +407,168 @@ func (client *TxClient) Stop() {
 	}
 }
 
+// submitterLoop processes queued transactions
+func (client *TxClient) submitterLoop() {
+	ticker := time.NewTicker(client.submitInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-client.submitterCtx.Done():
+			return
+		case <-ticker.C:
+			client.processQueues()
+		}
+	}
+}
+
+// monitorLoop monitors pending transactions
+func (client *TxClient) monitorLoop() {
+	ticker := time.NewTicker(client.monitorInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-client.monitorCtx.Done():
+			return
+		case entry := <-client.submissionEvents:
+			go client.monitorTransaction(entry)
+		case <-ticker.C:
+			client.monitorAllPendingTransactions()
+		}
+	}
+}
+
+// processQueues processes all account queues
+func (client *TxClient) processQueues() {
+	client.queueMutex.RLock()
+	queues := make([]*AccountQueue, 0, len(client.accountQueues))
+	for _, queue := range client.accountQueues {
+		queues = append(queues, queue)
+	}
+	client.queueMutex.RUnlock()
+	
+	for _, queue := range queues {
+		client.processAccountQueue(queue)
+	}
+}
+
+// processAccountQueue processes a single account queue
+func (client *TxClient) processAccountQueue(queue *AccountQueue) {
+	if queue.IsPaused() || queue.GetPendingCount() > 0 {
+		return
+	}
+	
+	entry := queue.Dequeue()
+	if entry == nil {
+		return
+	}
+	
+	// Submit the transaction
+	ctx := context.Background()
+	var resp *TxResponse
+	
+	if entry.Blobs != nil {
+		// Use legacy broadcast directly to avoid queue recursion
+		sdkResp, err := client.BroadcastPayForBlobWithAccount(ctx, queue.accountName, entry.Blobs, entry.Options...)
+		if err != nil {
+			entry.ResultCh <- &TxResult{Entry: entry, Error: err}
+			return
+		}
+		resp = &TxResponse{
+			Height:    sdkResp.Height,
+			TxHash:    sdkResp.TxHash,
+			Code:      sdkResp.Code,
+			Codespace: sdkResp.Codespace,
+			GasWanted: sdkResp.GasWanted,
+			GasUsed:   sdkResp.GasUsed,
+		}
+	} else if entry.Messages != nil {
+		// Use legacy broadcast directly to avoid queue recursion
+		sdkResp, err := client.BroadcastTx(ctx, entry.Messages, entry.Options...)
+		if err != nil {
+			entry.ResultCh <- &TxResult{Entry: entry, Error: err}
+			return
+		}
+		resp = &TxResponse{
+			Height:    sdkResp.Height,
+			TxHash:    sdkResp.TxHash,
+			Code:      sdkResp.Code,
+			Codespace: sdkResp.Codespace,
+			GasWanted: sdkResp.GasWanted,
+			GasUsed:   sdkResp.GasUsed,
+		}
+	} else {
+		err := fmt.Errorf("transaction entry has neither blobs nor messages")
+		entry.ResultCh <- &TxResult{Entry: entry, Error: err}
+		return
+	}
+	
+	entry.TxHash = resp.TxHash
+	queue.MoveToPending(entry)
+	
+	select {
+	case client.submissionEvents <- entry:
+	default:
+		// Channel full, handle gracefully
+	}
+}
+
+// monitorTransaction monitors a single transaction
+func (client *TxClient) monitorTransaction(entry *TxEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	
+	// Extract account name from entry ID (format: accountName-timestamp)
+	accountName := entry.ID
+	if lastDash := strings.LastIndex(entry.ID, "-"); lastDash > 0 {
+		accountName = entry.ID[:lastDash]
+	}
+	
+	client.queueMutex.RLock()
+	queue, exists := client.accountQueues[accountName]
+	client.queueMutex.RUnlock()
+	
+	if !exists {
+		entry.ResultCh <- &TxResult{Entry: entry, Error: fmt.Errorf("account queue not found")}
+		return
+	}
+	
+	txResp, err := client.ConfirmTx(ctx, entry.TxHash)
+	queue.RemoveFromPending(entry.TxHash)
+	
+	if err != nil {
+		entry.State = TxStateRejected
+		entry.ResultCh <- &TxResult{Entry: entry, Error: err}
+		return
+	}
+	
+	entry.State = TxStateCommitted
+	entry.ResultCh <- &TxResult{Entry: entry, Response: txResp}
+}
+
+// monitorAllPendingTransactions monitors all pending transactions for timeouts
+func (client *TxClient) monitorAllPendingTransactions() {
+	client.queueMutex.RLock()
+	defer client.queueMutex.RUnlock()
+	
+	for _, queue := range client.accountQueues {
+		queue.mutex.RLock()
+		for _, entry := range queue.pendingTxs {
+			if time.Since(entry.Created) > 10*time.Minute {
+				go client.handleStaleTransaction(queue, entry)
+			}
+		}
+		queue.mutex.RUnlock()
+	}
+}
+
+// handleStaleTransaction handles timed out transactions
+func (client *TxClient) handleStaleTransaction(queue *AccountQueue, entry *TxEntry) {
+	queue.RemoveFromPending(entry.TxHash)
+	entry.ResultCh <- &TxResult{Entry: entry, Error: fmt.Errorf("transaction timeout")}
+}
+
 // SubmitPayForBlob submits blobs using the new queue system to avoid race conditions
 func (client *TxClient) SubmitPayForBlob(ctx context.Context, blobs []*share.Blob, opts ...TxOption) (*TxResponse, error) {
 	return client.SubmitPayForBlobWithAccount(ctx, client.defaultAccount, blobs, opts...)
@@ -414,6 +576,23 @@ func (client *TxClient) SubmitPayForBlob(ctx context.Context, blobs []*share.Blo
 
 // SubmitPayForBlobWithAccount submits blobs for a specific account using the new race condition-free approach
 func (client *TxClient) SubmitPayForBlobWithAccount(ctx context.Context, accountName string, blobs []*share.Blob, opts ...TxOption) (*TxResponse, error) {
+	// Check if queue system is running, if not, fall back to direct submission  
+	if client.submitterCtx == nil {
+		// Background system not running, use direct submission
+		sdkResp, err := client.BroadcastPayForBlobWithAccount(ctx, accountName, blobs, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &TxResponse{
+			Height:    sdkResp.Height,
+			TxHash:    sdkResp.TxHash,
+			Code:      sdkResp.Code,
+			Codespace: sdkResp.Codespace,
+			GasWanted: sdkResp.GasWanted,
+			GasUsed:   sdkResp.GasUsed,
+		}, nil
+	}
+
 	resultCh := make(chan *TxResult, 1)
 	defer close(resultCh)
 	
@@ -446,6 +625,23 @@ func (client *TxClient) SubmitTx(ctx context.Context, msgs []sdktypes.Msg, opts 
 	accountName, err := client.getAccountNameFromMsgs(msgs)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check if queue system is running, if not, fall back to direct submission  
+	if client.submitterCtx == nil {
+		// Background system not running, use direct submission
+		sdkResp, err := client.BroadcastTx(ctx, msgs, opts...)
+		if err != nil {
+			return nil, err
+		}
+		return &TxResponse{
+			Height:    sdkResp.Height,
+			TxHash:    sdkResp.TxHash,
+			Code:      sdkResp.Code,
+			Codespace: sdkResp.Codespace,
+			GasWanted: sdkResp.GasWanted,
+			GasUsed:   sdkResp.GasUsed,
+		}, nil
 	}
 
 	resultCh := make(chan *TxResult, 1)
@@ -687,132 +883,6 @@ func (client *TxClient) enqueueTransaction(accountName string, entry *TxEntry) e
 	return nil
 }
 
-func (client *TxClient) submitterLoop() {
-	ticker := time.NewTicker(client.submitInterval)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-client.submitterCtx.Done():
-			return
-		case <-ticker.C:
-			client.processQueues()
-		}
-	}
-}
-
-func (client *TxClient) monitorLoop() {
-	ticker := time.NewTicker(client.monitorInterval)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-client.monitorCtx.Done():
-			return
-		case entry := <-client.submissionEvents:
-			go client.monitorTransaction(entry)
-		case <-ticker.C:
-			client.monitorAllPendingTransactions()
-		}
-	}
-}
-
-func (client *TxClient) processQueues() {
-	client.queueMutex.RLock()
-	queues := make([]*AccountQueue, 0, len(client.accountQueues))
-	for _, queue := range client.accountQueues {
-		queues = append(queues, queue)
-	}
-	client.queueMutex.RUnlock()
-	
-	for _, queue := range queues {
-		client.processAccountQueue(queue)
-	}
-}
-
-func (client *TxClient) processAccountQueue(queue *AccountQueue) {
-	if queue.IsPaused() || queue.GetPendingCount() > 0 {
-		return
-	}
-	
-	entry := queue.Dequeue()
-	if entry == nil {
-		return
-	}
-	
-	// Submit the transaction
-	ctx := context.Background()
-	var resp *sdktypes.TxResponse
-	var err error
-	
-	if entry.Blobs != nil {
-		resp, err = client.BroadcastPayForBlobWithAccount(ctx, queue.accountName, entry.Blobs, entry.Options...)
-	} else if entry.Messages != nil {
-		resp, err = client.BroadcastTx(ctx, entry.Messages, entry.Options...)
-	} else {
-		err = fmt.Errorf("transaction entry has neither blobs nor messages")
-	}
-	
-	if err != nil {
-		entry.ResultCh <- &TxResult{Entry: entry, Error: err}
-		return
-	}
-	
-	entry.TxHash = resp.TxHash
-	queue.MoveToPending(entry)
-	
-	select {
-	case client.submissionEvents <- entry:
-	default:
-		// Channel full, handle gracefully
-	}
-}
-
-func (client *TxClient) monitorTransaction(entry *TxEntry) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	
-	client.queueMutex.RLock()
-	queue, exists := client.accountQueues[entry.ID[:strings.LastIndex(entry.ID, "-")]]
-	client.queueMutex.RUnlock()
-	
-	if !exists {
-		entry.ResultCh <- &TxResult{Entry: entry, Error: fmt.Errorf("account queue not found")}
-		return
-	}
-	
-	txResp, err := client.ConfirmTx(ctx, entry.TxHash)
-	queue.RemoveFromPending(entry.TxHash)
-	
-	if err != nil {
-		entry.State = TxStateRejected
-		entry.ResultCh <- &TxResult{Entry: entry, Error: err}
-		return
-	}
-	
-	entry.State = TxStateCommitted
-	entry.ResultCh <- &TxResult{Entry: entry, Response: txResp}
-}
-
-func (client *TxClient) monitorAllPendingTransactions() {
-	client.queueMutex.RLock()
-	defer client.queueMutex.RUnlock()
-	
-	for _, queue := range client.accountQueues {
-		queue.mutex.RLock()
-		for _, entry := range queue.pendingTxs {
-			if time.Since(entry.Created) > 10*time.Minute {
-				go client.handleStaleTransaction(queue, entry)
-			}
-		}
-		queue.mutex.RUnlock()
-	}
-}
-
-func (client *TxClient) handleStaleTransaction(queue *AccountQueue, entry *TxEntry) {
-	queue.RemoveFromPending(entry.TxHash)
-	entry.ResultCh <- &TxResult{Entry: entry, Error: fmt.Errorf("transaction timeout")}
-}
 
 // GetQueueStatus returns status information about account queues
 func (client *TxClient) GetQueueStatus() map[string]map[string]interface{} {
