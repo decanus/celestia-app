@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/celestiaorg/celestia-app/v6/pkg/appconsts"
 	"github.com/celestiaorg/go-square/v3/share"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,16 +39,20 @@ func TestTxClientV2RaceConditionFix(t *testing.T) {
 		go func(txNum int) {
 			defer wg.Done()
 			
-			blob := &share.Blob{
-				NamespaceId:      appconsts.DefaultTxNamespaceID,
-				Data:             []byte(fmt.Sprintf("v2 test blob %d data", txNum)),
-				ShareVersion:     uint32(appconsts.ShareVersionZero),
-				NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
+			txStart := time.Now()
+			blob, err := share.NewBlob(share.RandomBlobNamespace(), []byte(fmt.Sprintf("v2 test blob %d data", txNum)), share.ShareVersionZero, nil)
+			if err != nil {
+				results <- &testResult{
+					TxNum:    txNum,
+					Error:    err,
+					Duration: time.Since(txStart),
+				}
+				return
 			}
 			
-			start := time.Now()
+			submitStart := time.Now()
 			txResp, err := client.SubmitPayForBlobV2(ctx, []*share.Blob{blob})
-			duration := time.Since(start)
+			duration := time.Since(submitStart)
 			
 			results <- &testResult{
 				TxNum:    txNum,
@@ -181,12 +184,8 @@ func TestSequentialProcessing(t *testing.T) {
 	// Add multiple transactions to queue
 	entries := make([]*TxEntry, 3)
 	for i := range entries {
-		blob := &share.Blob{
-			NamespaceId:      appconsts.DefaultTxNamespaceID,
-			Data:             []byte(fmt.Sprintf("sequential test blob %d", i)),
-			ShareVersion:     uint32(appconsts.ShareVersionZero),
-			NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
-		}
+		blob, err := share.NewBlob(share.RandomBlobNamespace(), []byte(fmt.Sprintf("sequential test blob %d", i)), share.ShareVersionZero, nil)
+		require.NoError(t, err)
 		
 		entries[i] = &TxEntry{
 			ID:      fmt.Sprintf("test-tx-%d", i),

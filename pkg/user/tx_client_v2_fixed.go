@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/celestiaorg/go-square/v3/share"
-	"github.com/cometbft/cometbft/rpc/core"
-	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -73,12 +71,13 @@ func (aq *AccountQueue) Enqueue(entry *TxEntry) {
 	aq.queuedTxs = append(aq.queuedTxs, entry)
 }
 
-// Dequeue returns the next transaction to be processed, or nil if queue is empty or paused
+// Dequeue returns the next transaction to be processed, or nil if queue is empty, paused, or has pending transactions
 func (aq *AccountQueue) Dequeue() *TxEntry {
 	aq.mutex.Lock()
 	defer aq.mutex.Unlock()
 	
-	if aq.paused || len(aq.queuedTxs) == 0 {
+	// Don't dequeue if paused, empty, or if there are pending transactions (sequential processing)
+	if aq.paused || len(aq.queuedTxs) == 0 || len(aq.pendingTxs) > 0 {
 		return nil
 	}
 	

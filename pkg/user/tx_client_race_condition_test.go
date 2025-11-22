@@ -7,10 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/celestiaorg/celestia-app/v6/pkg/appconsts"
 	"github.com/celestiaorg/go-square/v3/share"
-	"github.com/cometbft/cometbft/rpc/core"
-	sdktypes "github.com/cosmos/cosmos-sdk/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,19 +24,11 @@ func TestTxClientRaceCondition(t *testing.T) {
 	defer cancel()
 
 	// Create test blobs
-	blob1 := &share.Blob{
-		NamespaceId:      appconsts.DefaultTxNamespaceID,
-		Data:             []byte("test blob 1 data"),
-		ShareVersion:     uint32(appconsts.ShareVersionZero),
-		NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
-	}
+	blob1, err := share.NewBlob(share.RandomBlobNamespace(), []byte("test blob 1 data"), share.ShareVersionZero, nil)
+	require.NoError(t, err)
 	
-	blob2 := &share.Blob{
-		NamespaceId:      appconsts.DefaultTxNamespaceID,
-		Data:             []byte("test blob 2 data"),
-		ShareVersion:     uint32(appconsts.ShareVersionZero),
-		NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
-	}
+	blob2, err := share.NewBlob(share.RandomBlobNamespace(), []byte("test blob 2 data"), share.ShareVersionZero, nil)
+	require.NoError(t, err)
 
 	// Get initial sequence for tracking
 	account := client.Account(client.DefaultAccountName())
@@ -109,16 +98,20 @@ func TestConcurrentTransactionSubmission(t *testing.T) {
 		go func(txNum int) {
 			defer wg.Done()
 
-			blob := &share.Blob{
-				NamespaceId:      appconsts.DefaultTxNamespaceID,
-				Data:             []byte(fmt.Sprintf("concurrent test blob %d data", txNum)),
-				ShareVersion:     uint32(appconsts.ShareVersionZero),
-				NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
+			txStart := time.Now()
+			blob, err := share.NewBlob(share.RandomBlobNamespace(), []byte(fmt.Sprintf("concurrent test blob %d data", txNum)), share.ShareVersionZero, nil)
+			if err != nil {
+				results <- &txResult{
+					TxNum:     txNum,
+					Error:     err,
+					Duration:  time.Since(txStart),
+				}
+				return
 			}
 
-			start := time.Now()
+			submitStart := time.Now()
 			txResp, err := client.SubmitPayForBlob(ctx, []*share.Blob{blob})
-			duration := time.Since(start)
+			duration := time.Since(submitStart)
 
 			results <- &txResult{
 				TxNum:     txNum,
@@ -185,12 +178,8 @@ func TestEvictionRaceCondition(t *testing.T) {
 		largeBlobData[i] = byte(i % 256)
 	}
 
-	largeBlob := &share.Blob{
-		NamespaceId:      appconsts.DefaultTxNamespaceID,
-		Data:             largeBlobData,
-		ShareVersion:     uint32(appconsts.ShareVersionZero),
-		NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
-	}
+	largeBlob, err := share.NewBlob(share.RandomBlobNamespace(), largeBlobData, share.ShareVersionZero, nil)
+	require.NoError(t, err)
 
 	// Submit the large transaction that might get evicted
 	txResp, err := client.BroadcastPayForBlob(ctx, []*share.Blob{largeBlob})
@@ -233,14 +222,15 @@ func TestEvictionRaceCondition(t *testing.T) {
 			// Wait a bit to let the large transaction settle
 			time.Sleep(time.Duration(txNum+1) * 2 * time.Second)
 
-			smallBlob := &share.Blob{
-				NamespaceId:      appconsts.DefaultTxNamespaceID,
-				Data:             []byte(fmt.Sprintf("small concurrent blob %d", txNum)),
-				ShareVersion:     uint32(appconsts.ShareVersionZero),
-				NamespaceVersion: uint32(appconsts.NamespaceVersionZero),
+			smallBlob, err := share.NewBlob(share.RandomBlobNamespace(), []byte(fmt.Sprintf("small concurrent blob %d", txNum)), share.ShareVersionZero, nil)
+			if err != nil {
+				concurrentMutex.Lock()
+				concurrentResults = append(concurrentResults, err)
+				concurrentMutex.Unlock()
+				return
 			}
 
-			_, err := client.SubmitPayForBlob(ctx, []*share.Blob{smallBlob})
+			_, err = client.SubmitPayForBlob(ctx, []*share.Blob{smallBlob})
 			
 			concurrentMutex.Lock()
 			concurrentResults = append(concurrentResults, err)
