@@ -14,12 +14,11 @@ import (
 
 // TestTxClientV2RaceConditionFix verifies that the v2 implementation
 // resolves the race conditions identified in the original client
-func TestTxClientV2RaceConditionFix(t *testing.T) {
+func TestTxClientRaceConditionFix(t *testing.T) {
 	// Skip if no test environment available
 	t.Skip("This test requires a properly configured test environment")
 	
-	originalClient := setupTxClient(t)
-	client := NewTxClientV2(originalClient)
+	client := setupTxClient(t)
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -51,7 +50,7 @@ func TestTxClientV2RaceConditionFix(t *testing.T) {
 			}
 			
 			submitStart := time.Now()
-			txResp, err := client.SubmitPayForBlobV2(ctx, []*share.Blob{blob})
+			txResp, err := client.SubmitPayForBlob(ctx, []*share.Blob{blob})
 			duration := time.Since(submitStart)
 			
 			results <- &testResult{
@@ -80,11 +79,11 @@ func TestTxClientV2RaceConditionFix(t *testing.T) {
 		}
 	}
 	
-	t.Logf("V2 Client Results: %d successful, %d failed out of %d total", successful, failed, numConcurrentTx)
+	t.Logf("TxClient Results: %d successful, %d failed out of %d total", successful, failed, numConcurrentTx)
 	
-	// With the v2 implementation, we expect better success rates
+	// With the race condition fixes, we expect better success rates
 	successRate := float64(successful) / float64(numConcurrentTx)
-	assert.GreaterOrEqual(t, successRate, 0.8, "V2 client should have at least 80% success rate")
+	assert.GreaterOrEqual(t, successRate, 0.8, "TxClient should have at least 80% success rate")
 }
 
 // TestAccountQueueBasicFunctionality tests the basic queue operations
@@ -166,8 +165,7 @@ func TestSequentialProcessing(t *testing.T) {
 	// Skip if no test environment available
 	t.Skip("This test requires a properly configured test environment")
 	
-	originalClient := setupTxClient(t)
-	client := NewTxClientV2(originalClient)
+	client := setupTxClient(t)
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -210,8 +208,10 @@ func TestSequentialProcessing(t *testing.T) {
 
 // TestQueueStatusReporting tests the status reporting functionality
 func TestQueueStatusReporting(t *testing.T) {
-	originalClient := &TxClient{} // Mock client
-	client := NewTxClientV2(originalClient)
+	// Create a minimal TxClient for testing queue functionality
+	client := &TxClient{
+		accountQueues: make(map[string]*AccountQueue),
+	}
 	
 	// Create test queues
 	queue1 := NewAccountQueue("account1", "address1")
@@ -258,8 +258,10 @@ func TestEvictionHandling(t *testing.T) {
 
 // TestErrorRecovery tests error recovery mechanisms
 func TestErrorRecovery(t *testing.T) {
-	originalClient := &TxClient{} // Mock client
-	client := NewTxClientV2(originalClient)
+	// Create a minimal TxClient for testing
+	client := &TxClient{
+		accountQueues: make(map[string]*AccountQueue),
+	}
 	
 	queue := NewAccountQueue("test-account", "test-address")
 	
