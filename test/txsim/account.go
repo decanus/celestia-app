@@ -14,7 +14,6 @@ import (
 	"github.com/celestiaorg/celestia-app/v6/app/encoding"
 	"github.com/celestiaorg/celestia-app/v6/pkg/appconsts"
 	"github.com/celestiaorg/celestia-app/v6/pkg/user"
-	txclientv2 "github.com/celestiaorg/celestia-app/v6/pkg/user/v2"
 	"github.com/celestiaorg/go-square/v3/share"
 	tmservice "github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
 	"github.com/cosmos/cosmos-sdk/crypto/hd"
@@ -37,7 +36,7 @@ type AccountManager struct {
 
 	// to protect from concurrent writes to the map
 	mtx          sync.Mutex
-	txClient     *txclientv2.TxClient
+	txClient     *user.TxClient
 	balance      uint64
 	latestHeight uint64
 	lastUpdated  time.Time
@@ -148,7 +147,7 @@ func (am *AccountManager) setupMasterAccount(ctx context.Context, masterAccName 
 		return fmt.Errorf("error getting master account %s balance: %w", masterAccName, err)
 	}
 
-	am.txClient, err = txclientv2.SetupTxClient(ctx, am.keys, am.conn, am.encCfg, user.WithDefaultAccount(masterAccName), user.WithPollTime(am.pollTime))
+	am.txClient, err = user.SetupTxClient(ctx, am.keys, am.conn, am.encCfg, user.WithDefaultAccount(masterAccName), user.WithPollTime(am.pollTime))
 	if err != nil {
 		return err
 	}
@@ -276,7 +275,7 @@ func (am *AccountManager) Submit(ctx context.Context, op Operation) error {
 	}
 
 	var (
-		res *types.TxResponse
+		res *user.TxResponse
 		err error
 	)
 	if len(op.Blobs) > 0 {
